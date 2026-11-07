@@ -2,7 +2,7 @@
 
 **Experimental.** An AMD (HIP/ROCm) port of [tandem.cpp](https://github.com/ewhacc/tandem.cpp), built for tests in the ITLab lab. On our RX 9070 XT it did not beat [Strata](https://github.com/Niko1221/Strata), so we stopped working on it. We publish it as is, for anyone who wants to try tandem.cpp on their own AMD hardware.
 
-Write-up: _link to the itlab.cl article (coming soon)_
+Write-up: [English](https://itlab.cl/en/tandem-cpp-on-amd-port-rx-9070-xt/) · [Español](https://itlab.cl/tandem-cpp-en-amd-port-rx-9070-xt/)
 
 No guarantees: it ran on one card, with one model, in short tests. Read [Known weak points](#known-weak-points) and [Not validated](#not-validated) before you rely on it.
 
