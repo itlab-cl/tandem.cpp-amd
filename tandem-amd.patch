@@ -1,0 +1,164 @@
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 5a2fe201f..e00d0a6bf 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -2275,16 +2275,36 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor *
+         nb1, nb2, nb3, stream);
+ }
+ 
++#if defined(GGML_USE_HIP)
++// wall_clock64 runs at 100 MHz on gfx12
++static __device__ __forceinline__ uint64_t ggml_cuda_time_ns() {
++    return (uint64_t) wall_clock64()*10;
++}
++static __device__ __forceinline__ void ggml_cuda_nanosleep(const uint64_t ns) {
++    const uint64_t t0 = ggml_cuda_time_ns();
++    while (ggml_cuda_time_ns() - t0 < ns) {}
++}
++#else
++static __device__ __forceinline__ uint64_t ggml_cuda_time_ns() {
++    uint64_t t;
++    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
++    return t;
++}
++static __device__ __forceinline__ void ggml_cuda_nanosleep(const uint32_t ns) {
++    __nanosleep(ns);
++}
++#endif
++
+ // see ggml_host_add: one thread polls the flag in pinned host memory, then the add reads the data from host memory
+ static __global__ void k_host_add_wait(volatile uint32_t * flag) {
+     const uint32_t seen = flag[1];
+     uint64_t t0, t;
+-    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t0));
++    t0 = ggml_cuda_time_ns();
+     t = t0;
+     uint32_t v;
+     while ((v = flag[0]) == seen) {
+-        __nanosleep(200);
+-        asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
++        ggml_cuda_nanosleep(200);
++        t = ggml_cuda_time_ns();
+         if (t - t0 > 2000000000ull) {
+             flag[3] = flag[3] + 1;
+             break;
+@@ -2351,12 +2371,12 @@ static __global__ void k_moe_doorbell(volatile ggml_moe_db * vdb, int32_t * h_id
+         vdb->req = r;
+         __threadfence_system();
+         uint64_t t0, t;
+-        asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t0));
++        t0 = ggml_cuda_time_ns();
+         t = t0;
+         ok = 1;
+         while (vdb->ack != r) {
+-            __nanosleep(64);
+-            asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
++            ggml_cuda_nanosleep(64);
++            t = ggml_cuda_time_ns();
+             if (t - t0 > 2000000000ull) {
+                 vdb->timeouts = vdb->timeouts + 1;
+                 ok = 0;
+diff --git a/ggml/src/ggml-cuda/hc-fused.cu b/ggml/src/ggml-cuda/hc-fused.cu
+index 7c7929533..7c9ce623d 100644
+--- a/ggml/src/ggml-cuda/hc-fused.cu
++++ b/ggml/src/ggml-cuda/hc-fused.cu
+@@ -11,7 +11,9 @@
+ // the folded post and the normed input are the same values as the separate kernels give.
+ #include "hc-fused.cuh"
+ 
++#if !defined(GGML_USE_HIP)
+ #include <cuda_bf16.h>
++#endif
+ 
+ static constexpr int HCF_HC        = 4;   // streams
+ static constexpr int HCF_MAX_TOK   = 8;   // tokens per launch (decode, speculative verify)
+@@ -138,7 +140,7 @@ static __global__ void __launch_bounds__(HCF_A_THREADS) hc_mix_a(
+     for (int i = 0; i < NV; ++i) {
+         float v = i < RPB*NT ? p[i / NT][i % NT] : ss[i - RPB*NT];
+ #pragma unroll
+-        for (int o = 16; o > 0; o >>= 1) { v += __shfl_xor_sync(0xffffffff, v, o); }
++        for (int o = 16; o > 0; o >>= 1) { v += __shfl_xor_sync(0xffffffff, v, o, 32); }
+         if (lane == 0) { s_red[warp][i] = v; }
+     }
+     __syncthreads();
+@@ -230,7 +232,7 @@ static __global__ void hc_mix_b(
+ #pragma unroll
+         for (int t = 0; t < NT; ++t) {
+ #pragma unroll
+-            for (int o = 16; o > 0; o >>= 1) { g[s][t] += __shfl_xor_sync(0xffffffff, g[s][t], o); }
++            for (int o = 16; o > 0; o >>= 1) { g[s][t] += __shfl_xor_sync(0xffffffff, g[s][t], o, 32); }
+         }
+     }
+     if (lane < NT) {
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index 681402099..57fdeb016 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -1258,7 +1258,11 @@ static __global__ void mul_mat_vec_q_moe_dedup(
+             if (base >= n_pairs) {
+                 break;
+             }
++#if defined(GGML_USE_HIP)
++            uint32_t mask = (uint32_t) __ballot_sync(uint64_t(0xFFFFFFFF), (uint32_t) idq[c] == cx);
++#else
+             uint32_t mask = __ballot_sync(0xFFFFFFFF, (uint32_t) idq[c] == cx);
++#endif
+             if (base < p) {
+                 const uint32_t before = p - base >= warp_size ? 0xFFFFFFFF : ((1u << (p - base)) - 1);
+                 n_before += __popc(mask & before);
+diff --git a/ggml/src/ggml-cuda/vendors/hip.h b/ggml/src/ggml-cuda/vendors/hip.h
+index 8e8f5a4ee..738822512 100644
+--- a/ggml/src/ggml-cuda/vendors/hip.h
++++ b/ggml/src/ggml-cuda/vendors/hip.h
+@@ -66,6 +66,10 @@
+ #define cudaEventSynchronize hipEventSynchronize
+ #define cudaEvent_t hipEvent_t
+ #define cudaEventDestroy hipEventDestroy
++#define cudaEventCreate hipEventCreate
++#define cudaEventQuery hipEventQuery
++#define cudaEventElapsedTime hipEventElapsedTime
++#define cudaErrorNotSupported hipErrorNotSupported
+ #define cudaFree hipFree
+ #define cudaFreeHost hipHostFree
+ #define cudaGetDevice hipGetDevice
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index 05fed7245..e14b87f4b 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -2087,12 +2087,15 @@ void llama_model_base::load_tensors_ple_gpu() {
+         return;
+     }
+     // a CUDA host buffer (e.g. -lm none) is pinned and mapped already
+-    if (strcmp(ggml_backend_buffer_name(per_layer_tok_embd->buffer), "CUDA_Host") == 0) {
++    if (strcmp(ggml_backend_buffer_name(per_layer_tok_embd->buffer), "CUDA_Host") == 0 || strcmp(ggml_backend_buffer_name(per_layer_tok_embd->buffer), "ROCm_Host") == 0) {
+         ple_host_mapped = true;
+         LLAMA_LOG_INFO("%s: LLAMA_PLE_GPU: '%s' is in CUDA_Host memory, the GPU gathers its rows\n", __func__, per_layer_tok_embd->name);
+         return;
+     }
+     ggml_backend_reg_t reg = ggml_backend_reg_by_name("CUDA");
++    if (reg == nullptr) {
++        reg = ggml_backend_reg_by_name("ROCm");
++    }
+     auto reg_fn = reg ? (bool (*)(void *, size_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_register_host_buffer") : nullptr;
+     if (reg_fn == nullptr) {
+         LLAMA_LOG_WARN("%s: LLAMA_PLE_GPU: no CUDA host registration, the table stays on the CPU path\n", __func__);
+@@ -2105,7 +2108,8 @@ void llama_model_base::load_tensors_ple_gpu() {
+     const uintptr_t b = (uintptr_t) per_layer_tok_embd->data & ~(uintptr_t) (page - 1);
+     const uintptr_t e = ((uintptr_t) per_layer_tok_embd->data + ggml_nbytes(per_layer_tok_embd) + page - 1) & ~(uintptr_t) (page - 1);
+     const int64_t t0 = ggml_time_us();
+-    ple_host_mapped = reg_fn((void *) b, e - b);
++    // on ROCm, registering file-backed pages blocks the driver for many minutes: use the anonymous copy below
++    ple_host_mapped = strcmp(ggml_backend_reg_name(reg), "ROCm") == 0 ? false : reg_fn((void *) b, e - b);
+     LLAMA_LOG_INFO("%s: LLAMA_PLE_GPU: %s %.2f GiB of '%s' (%s) in %.1f s\n", __func__, ple_host_mapped ? "registered" : "FAILED to register",
+         (e - b)/1073741824.0, per_layer_tok_embd->name, ggml_backend_buffer_name(per_layer_tok_embd->buffer), (ggml_time_us() - t0)/1e6);
+ #ifdef __linux__
+@@ -2191,6 +2195,9 @@ void llama_model_base::load_tensors_exps_pin() {
+         return;
+     }
+     ggml_backend_reg_t reg = ggml_backend_reg_by_name("CUDA");
++    if (reg == nullptr) {
++        reg = ggml_backend_reg_by_name("ROCm");
++    }
+     auto reg_fn   = reg ? (bool (*)(void *, size_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_register_host_buffer") : nullptr;
+     auto unreg_fn = reg ? (void (*)(void *)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_unregister_host_buffer") : nullptr;
+     if (reg_fn == nullptr || unreg_fn == nullptr) {
